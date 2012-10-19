@@ -49,40 +49,45 @@ enum{
   cBR,
   cBRT,
   cFBRT,
+  cMISC,
   INS_COUNT_SIZE
 };
 
 static UINT64 ins_count[INS_COUNT_SIZE];
-/*
-static UINT64 dyn_count = 0;
-static UINT64 int_count = 0;
-static UINT64 fl_count  = 0;
-static UINT64 ld_count  = 0;
-static UINT64 st_count  = 0;
-static UINT64 br_count  = 0;
-//static UINT64 brt_count = 0;
-//static UINT64 fbrt_count = 0;
-*/
+//static ADDRINT PCloc;
 
-// This function is called before every instruction is executed
-VOID docount(UINT32 type) { 
+// This function updates instruction counts
+VOID docount(UINT32 type) {
   ins_count[cDYN]++;
   ins_count[type]++;
 }
-    
+
+// This function updates instruction flow
+VOID br_detect(INT32 addr){
+  cout << "ADDRESS: "  << addr << endl;
+}
+
 // Pin calls this function every time a new instruction is encountered
 VOID Instruction(INS ins, VOID *v)
 {
-    // Insert a call to docount before every instruction, no arguments are passed
+    //Insert a call to docount before every instruction, no arguments are passed
     //Parse instruction type
-    UINT32 type;
-    //cout << "INST: " << CATEGORY_StringShort(INS_Category(ins)) << endl;
+    UINT32 type=cMISC;
     if(INS_IsMemoryRead(ins)) type=cLD;
-    if(INS_IsMemoryWrite(ins)) type=cST;
-    if(INS_IsBranchOrCall(ins)) type=cBR;
-    else type=cDYN;
-    type=cDYN;
+    else if(INS_IsMemoryWrite(ins)) type=cST;
+    else if(INS_IsBranchOrCall(ins)) type=cBR;
+    else{
+      if(INS_OperandCount(ins)){
+        if(INS_OperandIsReg(ins,0)){
+          REG reg=INS_OperandReg(ins,0);
+          if(REG_is_fr(reg)) type=cFL;
+          else type=cINT;
+        }
+      }
+    }
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount, IARG_UINT32, type, IARG_END);
+    //Parse Branch Taken
+    INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)br_detect, IARG_ADDRINT, INS_Address(ins), IARG_END);
 }
 
 KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool",
@@ -101,6 +106,7 @@ VOID Fini(INT32 code, VOID *v)
     cout << "Load:\t" << ins_count[cLD] << endl;
     cout << "Store:\t" << ins_count[cST] << endl;
     cout << "Branch:\t" << ins_count[cBR] << endl;
+    cout << "Other:\t" << ins_count[cMISC] << endl;
 }
 
 /* ===================================================================== */
