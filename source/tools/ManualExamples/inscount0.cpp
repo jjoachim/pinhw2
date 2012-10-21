@@ -31,11 +31,19 @@ END_LEGAL */
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <math.h>
+#include <list>
+#include <math.h> //for sqrt()
 #include "pin.H"
 #include "portability.H"
 
+#define RDD_BINS 6 //This means track dependency distance from 2 to 2^n in increments of powers of 2.
+
 using namespace std;
+
+/* NOTES:
+ * RDD means Register Dependency Distance
+ */
+
 
 ofstream OutFile;
 
@@ -52,13 +60,45 @@ enum{
   cMISC,
   INS_COUNT_SIZE
 };
+enum{
+  cRAW,
+  cWAW,
+  cWAR,
+  RDD_SIZE,
+};
+
+// Struct for RDD tracking
+struct Register_Use{ //Used when instruction used a register
+  int ID; //REG ID or count, based on context
+  int Rd_Wr; //0 is Read, 1 is Write
+};
+struct Register_Hist{ //Used to track register use history for RDD
+  int ID;
+  int Wr_Clk; //Clock when last write occurred
+  int Rd_Clk; //Clock when last read occurred
+};
+struct MemRefTrack{ //Used to track memory references
+  ADDRINT addr; //address of memory reference
+  int repeat; //0 if this address is only referenced once, aka infinite inter-reference
+};
+
+struct MemRefCount{ //Used Track memory reference distances
+  MemRefCount(int dist, int c) {distance=dist; count=c;}
+  MemRefCount() { MemRefCount(0,0); }
+  bool operator== (MemRefCount mrc) { return distance == mrc.distance; } //Used for the find() function
+  bool operator<  (MemRefCount mrc) { return distance <  mrc.distance; } //Used for the sort() function
+  int distance; //how far was it
+  int count; //how many times has this distance occurred
+};
 
 // Counting structures
 static UINT64 ins_count[INS_COUNT_SIZE]; //The running count of instructions is kept here
 static int lbr_dist=0; //Last branch distance
 static vector<int> bblsz; //Basic Block Size list
-static vector<int> regs; //A list of values that indicate a register's last use.  Used for RAW, WAW, and WAR
-
+static Register_Hist regs[REG_LAST]; //A list of values that indicate a register's last use.  Used for RAW, WAW, and WAR
+static unsigned int RDD_count[RDD_SIZE][RDD_BINS]; //Stores RAW, WAW, and WAR counts
+static list<MemRefTrack> mf_track; //list of memory references to measure temporal locality
+static list<MemRefCount> mf_count; //list of memory reference distances
 // This function updates instruction counts
 VOID InsCountF(UINT32 type) {
   lbr_dist++; //Every instruction increases the distance between two branches
@@ -79,26 +119,110 @@ VOID BrCallCountF(ADDRINT current, ADDRINT target, BOOL taken){
   }
 }
 
+// These functions update RAW, WAW, and WAR stats.
+// This function sorts a value in distance bins based on RDD_BINS (<=2, <=4, ect...)
+int ghetto_log2(int val){
+  //if(val<=0) cout << "Val: " << val << endl;
+  if (val<=0) return 0; //Just to avoid any dumb problems
+  int bin=-1;
+  while(val>>=1) bin++; //this loops will execute at least once since val must be >0
+  if(bin>=RDD_BINS) bin=RDD_BINS-1; //don't go over the maximum bin
+  return bin;
+}
+
+VOID RDDCountF(VOID* arglist, UINT32 size){
+  Register_Use* ru=(Register_Use*)arglist;  //Arglist points to an array of Operand_Used structs
+  int ID; //Register ID
+  int dist; //The distance between the last access
+  for(UINT32 i=0; i<size; i++){
+    ID=ru[i].ID;
+    if(ID==0) continue; //The operand was not a register! Skip it. (Probably an immidiate)
+    //Access type, aka RAW, WAW, or WAR.  RAR is skipped
+    if(ru[i].Rd_Wr==0){ //Reads update just RAW
+      dist=ins_count[cDYN]-regs[ID].Wr_Clk; //Current_Clock - LastWrite_Clock
+      RDD_count[cRAW][ghetto_log2(dist)]++; //increment the corresponding bin
+     
+      regs[ID].Rd_Clk=ins_count[cDYN]; //update LastRead_Clock for this register
+    }
+    else{ //Writes update WAW and WAR
+      //WAW update first (order does not particularly matter)
+      dist=ins_count[cDYN]-regs[ID].Wr_Clk;
+      RDD_count[cWAW][ghetto_log2(dist)]++;
+      //WAR update
+      dist=ins_count[cDYN]-regs[ID].Rd_Clk;
+      RDD_count[cWAR][ghetto_log2(dist)]++;
+      
+      regs[ID].Wr_Clk=ins_count[cDYN]; //update LastWrite_Clock for this register
+    }
+  }
+}
+
+// These function tracks memory references for temporal locality measurement
+VOID MemRefCountF(ADDRINT addr){
+  list<MemRefTrack>::iterator it;
+  int dist=0;
+  for(it=mf_track.begin(); it!=mf_track.end(); it++){
+    if((it->addr)==addr){ //found a matching address!
+      //find if we have seen this distance before
+      MemRefCount mfc(dist,0);
+      list<MemRefCount>::iterator mfc_it=find(mf_count.begin(), mf_count.end(), mfc);
+      if(mfc_it==mf_count.end()){ //didn't find it, add it to the list
+        mfc.count=1;
+        mf_count.push_back(mfc);
+      }
+      else //found it! update the count
+        (mfc_it->count)++;
+      //Update the LRU list for addresses
+      MemRefTrack new_ref=*it; //remember it
+      new_ref.repeat=1; //we know it's repeated
+      mf_track.erase(it); //remove it
+      mf_track.push_front(new_ref); //stick it back to the front
+      return;
+    }
+    dist++;
+  }
+  //It's a new address reference.  Add it to the list at the front
+  MemRefTrack new_ref;
+  new_ref.addr=addr;
+  new_ref.repeat=0;
+  mf_track.push_front(new_ref);
+}
+
 // Pin calls this function every time a new instruction is encountered
 VOID Instruction(INS ins, VOID *v)
 {
     //Parse instruction type
     UINT32 type=cMISC;
-    if(INS_IsMemoryRead(ins)) type=cLD;
-    else if(INS_IsMemoryWrite(ins)) type=cST;
-    else if(INS_IsBranchOrCall(ins)){ //handle branch parsing
+    if(INS_IsMemoryRead(ins)){
+      type=cLD; //check memory read operation
+      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)MemRefCountF, IARG_MEMORYREAD_EA, IARG_END);
+    }
+    else if(INS_IsMemoryWrite(ins)){
+      type=cST; //check memory write operation
+      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)MemRefCountF, IARG_MEMORYWRITE_EA, IARG_END);
+    }
+    else if(INS_IsBranchOrCall(ins)){ //check branch operation
       type=cBR;
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)BrCallCountF, IARG_INST_PTR, IARG_BRANCH_TARGET_ADDR, IARG_BRANCH_TAKEN, IARG_END);
     }
-    else{
-      if(INS_OperandCount(ins)){
-        if(INS_OperandIsReg(ins,0)){
+    else{ //check arithmetic operation
+      UINT32 opcount=INS_OperandCount(ins); //Total operands in instruction
+      if(opcount){ //If there's at least one, the first one must be a destination register
+        if(INS_OperandIsReg(ins,0)){ //check to make sure that it is a destination for shits n giggles
           REG reg=INS_OperandReg(ins,0);
-          if(REG_is_fr(reg)) type=cFL;
-          else type=cINT;
+          if(REG_is_fr(reg)) type=cFL; //If the DR is a floating point, then it is a floating point operation
+          else type=cINT; //otherwise, it must be an integer operation
         }
       }
+      Register_Use* ops_used=new Register_Use[opcount]; //A list of operands used in this instruction
+      for(UINT32 i=0; i<opcount; i++){ //Parse through all the operands, list their ID and if they are R_Wr
+        ops_used[i].ID=(int)INS_OperandReg(ins,i); //immidiates are stored as ID=0
+        ops_used[i].Rd_Wr=INS_OperandWritten(ins,i); //0 is Read, 1 is Write
+      }
+      //Tracks RDD stuff
+      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)RDDCountF, IARG_PTR, (VOID*)ops_used, IARG_UINT32, opcount, IARG_END);
     }
+    //Tracks instruction distribution
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)InsCountF, IARG_UINT32, type, IARG_END);
 }
 
@@ -109,18 +233,25 @@ KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool",
 // This function is called when the application exits
 VOID Fini(INT32 code, VOID *v)
 {
-    //Basic Block Size: Mean
+    // Basic Block Size: Mean
     long int bblsz_mean=0;
     for (unsigned int i=0; i<bblsz.size(); i++)
       bblsz_mean+=bblsz[i]; 
     bblsz_mean/=(bblsz.size());
-    //Basic Block Size: Standard Deviation
+    // Basic Block Size: Standard Deviation
     double bblsz_stdv=0;
     for (unsigned int i=0; i<bblsz.size(); i++){
       int diff=bblsz[i]-bblsz_mean;
       bblsz_stdv+=(diff*diff);
     }
     bblsz_stdv=sqrt( bblsz_stdv/(double)bblsz.size() );
+    // Sort Memory Reference Distances, find single memory references
+    mf_count.sort();
+
+    MemRefCount mfc(-1,0);
+    mf_count.push_back(mfc);
+    for(list<MemRefTrack>::iterator it=mf_track.begin(); it!=mf_track.end(); it++)
+      if((it->repeat)==0) mf_count.back().count++;
     // Write to a file since cout and cerr maybe closed by the application
     OutFile.setf(ios::showbase);
     OutFile << "Count " << ins_count[cDYN] << endl;
@@ -138,6 +269,19 @@ VOID Fini(INT32 code, VOID *v)
     cout << "BBL Count:\t" << bblsz.size() << endl;
     cout << "BBL Size Avg:\t" << bblsz_mean << endl;
     cout << "BBL Size STDV:\t" << bblsz_stdv << endl;
+    cout << "\nRDD Stats:\n";
+    for(int i=0; i<RDD_SIZE; i++){
+      cout << "Type " << i << ':';
+      for(int j=0; j<RDD_BINS; j++){
+        cout << '\t' << RDD_count[i][j];
+      }
+      cout << endl;
+    }
+    cout << "\nInter-Reference Stats:\n";
+    //for(list<MemRefCount>::iterator it=mf_count.begin(); it!=mf_count.end(); it++)
+    list<MemRefCount>::iterator it=mf_count.end();
+    cout << "Distance " << it->distance  << ": " << it->count << endl;
+    cout << "Size: " << mf_count.size() << endl;
 }
 
 /* ===================================================================== */
@@ -159,8 +303,18 @@ INT32 Usage()
 
 int main(int argc, char * argv[])
 {
-    // Clear Counts
-    for(int i=0; i<INS_COUNT_SIZE; i++) ins_count[i]=0;
+    // Initialize Instruction Counts
+    for(int i=0; i<INS_COUNT_SIZE; i++) 
+      ins_count[i]=0;
+    // Initialize RDD Counts and Registers
+    for(int i=0; i<REG_LAST; i++){ //Reset LastWrite_Clock and LastRead_Clock for registers
+      regs[i].Wr_Clk=0;
+      regs[i].Rd_Clk=0;
+    }
+    for(int i=0; i<RDD_SIZE; i++)
+      for(int j=0; j<RDD_BINS; j++)
+        RDD_count[i][j]=0; //Reset RAW, WAW, and WAR counts.
+
     // Initialize pin
     if (PIN_Init(argc, argv)) return Usage();
 
