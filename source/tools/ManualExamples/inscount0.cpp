@@ -44,6 +44,12 @@ using namespace std;
  * RDD means Register Dependency Distance
  */
 
+//This array specifies how many LSB to ignore in address references when measuring temporal locality
+//char TempLocGran[]={0, 5, 11}; //ignore 0, 5 (32B), and 11 (2KB) bits of the referenced addresses respectively
+char TempLocGran[]={11}; //ignore 0, 5 (32B), and 11 (2KB) bits of the referenced addresses respectively
+PIN_THREAD_UID ThreadUID[sizeof(TempLocGran)]; //an exit code for each granularity
+int SlaveMemParse[sizeof(TempLocGran)]; //how many memory locations have the slaves parsed (for moderator)
+int ModMemParse=0; //How mnay memory references has the Moderator cleaned up
 
 ofstream OutFile;
 
@@ -97,8 +103,12 @@ static int lbr_dist=0; //Last branch distance
 static vector<int> bblsz; //Basic Block Size list
 static Register_Hist regs[REG_LAST]; //A list of values that indicate a register's last use.  Used for RAW, WAW, and WAR
 static unsigned int RDD_count[RDD_SIZE][RDD_BINS]; //Stores RAW, WAW, and WAR counts
-static list<MemRefTrack> mf_track; //list of memory references to measure temporal locality
-static list<MemRefCount> mf_count; //list of memory reference distances
+
+list<ADDRINT> memref_FIFO; //FIFO for slave threads to read
+int FIFOsize=0;
+list<MemRefCount> mfc[sizeof(TempLocGran)]; //different temporal locality charts
+int slavemod_exit=0; //signal set by master to make the moderator and slaves exit
+
 // This function updates instruction counts
 VOID InsCountF(UINT32 type) {
   lbr_dist++; //Every instruction increases the distance between two branches
@@ -121,12 +131,12 @@ VOID BrCallCountF(ADDRINT current, ADDRINT target, BOOL taken){
 
 // These functions update RAW, WAW, and WAR stats.
 // This function sorts a value in distance bins based on RDD_BINS (<=2, <=4, ect...)
-int ghetto_log2(int val){
+int ghetto_log2(int val, int max){
   //if(val<=0) cout << "Val: " << val << endl;
   if (val<=0) return 0; //Just to avoid any dumb problems
   int bin=-1;
   while(val>>=1) bin++; //this loops will execute at least once since val must be >0
-  if(bin>=RDD_BINS) bin=RDD_BINS-1; //don't go over the maximum bin
+  if(bin>=max) bin=max-1; //don't go over the maximum bin
   return bin;
 }
 
@@ -140,17 +150,17 @@ VOID RDDCountF(VOID* arglist, UINT32 size){
     //Access type, aka RAW, WAW, or WAR.  RAR is skipped
     if(ru[i].Rd_Wr==0){ //Reads update just RAW
       dist=ins_count[cDYN]-regs[ID].Wr_Clk; //Current_Clock - LastWrite_Clock
-      RDD_count[cRAW][ghetto_log2(dist)]++; //increment the corresponding bin
+      RDD_count[cRAW][ghetto_log2(dist,RDD_BINS)]++; //increment the corresponding bin
      
       regs[ID].Rd_Clk=ins_count[cDYN]; //update LastRead_Clock for this register
     }
     else{ //Writes update WAW and WAR
       //WAW update first (order does not particularly matter)
       dist=ins_count[cDYN]-regs[ID].Wr_Clk;
-      RDD_count[cWAW][ghetto_log2(dist)]++;
+      RDD_count[cWAW][ghetto_log2(dist,RDD_BINS)]++;
       //WAR update
       dist=ins_count[cDYN]-regs[ID].Rd_Clk;
-      RDD_count[cWAR][ghetto_log2(dist)]++;
+      RDD_count[cWAR][ghetto_log2(dist,RDD_BINS)]++;
       
       regs[ID].Wr_Clk=ins_count[cDYN]; //update LastWrite_Clock for this register
     }
@@ -158,34 +168,102 @@ VOID RDDCountF(VOID* arglist, UINT32 size){
 }
 
 // These function tracks memory references for temporal locality measurement
-VOID MemRefCountF(ADDRINT addr){
-  list<MemRefTrack>::iterator it;
-  int dist=0;
-  for(it=mf_track.begin(); it!=mf_track.end(); it++){
-    if((it->addr)==addr){ //found a matching address!
-      //find if we have seen this distance before
-      MemRefCount mfc(dist,0);
-      list<MemRefCount>::iterator mfc_it=find(mf_count.begin(), mf_count.end(), mfc);
-      if(mfc_it==mf_count.end()){ //didn't find it, add it to the list
-        mfc.count=1;
-        mf_count.push_back(mfc);
-      }
-      else //found it! update the count
-        (mfc_it->count)++;
-      //Update the LRU list for addresses
-      MemRefTrack new_ref=*it; //remember it
-      new_ref.repeat=1; //we know it's repeated
-      mf_track.erase(it); //remove it
-      mf_track.push_front(new_ref); //stick it back to the front
-      return;
+// The master thread will supply memory references to memref_FIFO with MemRefAdd()
+// The moderator thread will delete memory accesses that the slaves have consumed
+// The slave threads will constantly read memory reference elements, waiting at the end, until told to stop
+VOID MemRefAddF(ADDRINT addr){ //used by the master thread to supply memory references
+  memref_FIFO.push_back(addr);
+  FIFOsize++;
+}
+
+VOID MemRefModF(VOID* arg){ //moderator function
+  cout << "Moderator Spawned" << endl;
+  ModMemParse=5; //a nice little buffer so we don't accidently delete something we are using
+  unsigned int i;
+  int remove;
+  while(slavemod_exit==0){ //exit flag given by master thread
+    remove=1;
+    for(i=0; i<sizeof(TempLocGran); i++){
+      remove &= (ModMemParse < SlaveMemParse[i]);
+      //cout << SlaveMemParse[i] << " ";
     }
-    dist++;
+    //cout << memref_FIFO.size() << " " << slavemod_exit  << endl;
+    //sleep(1);
+    //remove=0;
+    if(remove){
+      memref_FIFO.pop_front();
+      ModMemParse++;
+    }
   }
-  //It's a new address reference.  Add it to the list at the front
-  MemRefTrack new_ref;
-  new_ref.addr=addr;
-  new_ref.repeat=0;
-  mf_track.push_front(new_ref);
+}
+
+VOID Para_MemRefCountF(VOID* arg){ //slave function
+  //parse inputs
+  unsigned int slaveid=*(unsigned int*)arg;
+  cout << "Slave " << slaveid << " Spawned" << endl;
+  SlaveMemParse[slaveid]=0;
+  
+  int gran=(int)TempLocGran[slaveid];
+  list<MemRefTrack> mf_track; //LRU list of memory references, deleted when finished
+  list<MemRefCount> mf_count; //the distance counting list, copied into a global list when finished
+
+  int dist;
+  ADDRINT addr; //address to parse, read from glit
+  list<MemRefTrack>::iterator it; //iterator to search LRU memory table 
+  list<ADDRINT>::iterator memref_FIFOit=memref_FIFO.begin();
+
+  while( (SlaveMemParse[slaveid]<FIFOsize) || (slavemod_exit==0) ){ //loop until exit signal and out of memory elements
+    while( (SlaveMemParse[slaveid]>=FIFOsize) && (slavemod_exit==0)) sleep(1);
+    //cout << "WAITING" << endl; //wait until new memory element or exit signal
+    if(slavemod_exit && SlaveMemParse[slaveid]>=FIFOsize) break; //finish up if there was an exit signal and all memory references are parsed
+    memref_FIFOit++; //next memory address, will wait if it isn't there
+    dist=0; //reset distance marker
+    addr=*memref_FIFOit; //copy the reference address
+    addr=addr>>gran; //fit address to granularity
+    for(it=mf_track.begin(); it!=mf_track.end(); it++){ //find the memory address in LRU table
+      if((it->addr)==addr){ //found this address!
+        //find if we have seen this distance before, we need to see if this distance is already recorded
+        MemRefCount mfc(dist,1);
+        list<MemRefCount>::iterator mfc_it=find(mf_count.begin(), mf_count.end(), mfc);
+        if(mfc_it==mf_count.end()) //didn't find this distance, add it to the list
+          mf_count.push_back(mfc);
+        else //found this distance! update the count
+          (mfc_it->count)++;
+        //Update the LRU list for addresses
+        MemRefTrack new_ref=*it; //remember it
+        new_ref.repeat=1; //we know it's repeated
+        mf_track.erase(it); //remove it
+        mf_track.push_front(new_ref); //stick it back to the front
+        break; //we found the memory address, so stop searching
+      }
+      dist++; //this element doesn't match the memory address, so increment distance
+    }
+    if(it==mf_track.end()){ //It's a new address reference.  Add it to the list at the front
+      MemRefTrack new_ref;
+      new_ref.addr=addr;
+      new_ref.repeat=0;
+      mf_track.push_front(new_ref);
+    }
+    SlaveMemParse[slaveid]++; //I parsed one more memory reference
+  }
+  //Stop signal has been given
+  cout << "Slave " << slaveid << " Finishing up." << endl;
+  //Sort the inter-reference distance list
+  mf_count.sort();
+  //Count infinite references
+  MemRefCount mfc(-1,0);
+  mf_count.push_back(mfc);
+  for(list<MemRefTrack>::iterator it=mf_track.begin(); it!=mf_track.end(); it++)
+    if((it->repeat)==0) mf_count.back().count++;
+  //Copy inter-reference distance count list to a global list
+  for(unsigned int i=0; i<sizeof(TempLocGran); i++){
+    if(gran==TempLocGran[i]){
+      ::mfc[i].swap(mf_count); //indicate that I want the global mfc, not any temporary ones made here
+      break;
+    }
+  }
+  cout << ::mfc[slaveid].back().distance << ": " << ::mfc[slaveid].back().count << endl;
+  //slave is done
 }
 
 // Pin calls this function every time a new instruction is encountered
@@ -195,11 +273,11 @@ VOID Instruction(INS ins, VOID *v)
     UINT32 type=cMISC;
     if(INS_IsMemoryRead(ins)){
       type=cLD; //check memory read operation
-      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)MemRefCountF, IARG_MEMORYREAD_EA, IARG_END);
+      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)MemRefAddF, IARG_MEMORYREAD_EA, IARG_END);
     }
     else if(INS_IsMemoryWrite(ins)){
       type=cST; //check memory write operation
-      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)MemRefCountF, IARG_MEMORYWRITE_EA, IARG_END);
+      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)MemRefAddF, IARG_MEMORYWRITE_EA, IARG_END);
     }
     else if(INS_IsBranchOrCall(ins)){ //check branch operation
       type=cBR;
@@ -233,6 +311,9 @@ KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool",
 // This function is called when the application exits
 VOID Fini(INT32 code, VOID *v)
 {
+    //Tell Moderator to stop (which tells slaves to stop)
+    cout << "Killing Threads " << endl;
+    slavemod_exit=1;
     // Basic Block Size: Mean
     long int bblsz_mean=0;
     for (unsigned int i=0; i<bblsz.size(); i++)
@@ -245,13 +326,10 @@ VOID Fini(INT32 code, VOID *v)
       bblsz_stdv+=(diff*diff);
     }
     bblsz_stdv=sqrt( bblsz_stdv/(double)bblsz.size() );
-    // Sort Memory Reference Distances, find single memory references
-    mf_count.sort();
-
-    MemRefCount mfc(-1,0);
-    mf_count.push_back(mfc);
-    for(list<MemRefTrack>::iterator it=mf_track.begin(); it!=mf_track.end(); it++)
-      if((it->repeat)==0) mf_count.back().count++;
+    // Wait for all slave threads to stop
+    cout << "Waiting for slaves to stop" << endl;
+    for(unsigned int i=0; i<sizeof(TempLocGran); i++)
+      while(!PIN_WaitForThreadTermination(ThreadUID[i],1000,NULL));
     // Write to a file since cout and cerr maybe closed by the application
     OutFile.setf(ios::showbase);
     OutFile << "Count " << ins_count[cDYN] << endl;
@@ -279,9 +357,9 @@ VOID Fini(INT32 code, VOID *v)
     }
     cout << "\nInter-Reference Stats:\n";
     //for(list<MemRefCount>::iterator it=mf_count.begin(); it!=mf_count.end(); it++)
-    list<MemRefCount>::iterator it=mf_count.end();
+    list<MemRefCount>::iterator it=mfc[0].end();
     cout << "Distance " << it->distance  << ": " << it->count << endl;
-    cout << "Size: " << mf_count.size() << endl;
+    cout << "Size: " << mfc[0].size() << endl;
 }
 
 /* ===================================================================== */
@@ -304,8 +382,7 @@ INT32 Usage()
 int main(int argc, char * argv[])
 {
     // Initialize Instruction Counts
-    for(int i=0; i<INS_COUNT_SIZE; i++) 
-      ins_count[i]=0;
+    for(int i=0; i<INS_COUNT_SIZE; i++) ins_count[i]=0;
     // Initialize RDD Counts and Registers
     for(int i=0; i<REG_LAST; i++){ //Reset LastWrite_Clock and LastRead_Clock for registers
       regs[i].Wr_Clk=0;
@@ -314,12 +391,18 @@ int main(int argc, char * argv[])
     for(int i=0; i<RDD_SIZE; i++)
       for(int j=0; j<RDD_BINS; j++)
         RDD_count[i][j]=0; //Reset RAW, WAW, and WAR counts.
-
     // Initialize pin
     if (PIN_Init(argc, argv)) return Usage();
 
     OutFile.open(KnobOutputFile.Value().c_str());
 
+    // Start temporal locality threads
+    PIN_SpawnInternalThread(MemRefModF,NULL,0,NULL); //Moderator
+    for(unsigned int i=0; i<sizeof(TempLocGran); i++){
+      SlaveMemParse[i]=i;
+      PIN_SpawnInternalThread(Para_MemRefCountF, &SlaveMemParse[i], 0, &ThreadUID[i]); //Moderator
+    }
+    
     // Register Instruction to be called to instrument instructions
     INS_AddInstrumentFunction(Instruction, 0);
 
@@ -328,6 +411,7 @@ int main(int argc, char * argv[])
     
     // Start the program, never returns
     PIN_StartProgram();
+    cout << "TEST" << endl;
 
     return 0;
 }
