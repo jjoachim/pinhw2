@@ -8,5 +8,5 @@ if [ $result -eq 0 ]; then
   echo
   echo Running Program...
   echo
-  /usr/bin/time -f "real\t%es\nuser\t%Us\nsys\t%Ss\nMem\t%KKB\n\n" pin -t inscount0.so -- ./test
+  time pin -t inscount0.so -- ./Lab2Benchmarks/403.gcc/gcc_base.i386 ./Lab2Benchmarks/403.gcc/scilab.i -o scilab.s
 fi

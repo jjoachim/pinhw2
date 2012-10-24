@@ -3,8 +3,10 @@
 
 int main(){
   float c;
-  for(int i=0; i<100; i++){
-    c=c+.5;
+  for(int i=0; i<300; i++){
+    for(int j=0; j<300; j++){
+      c=c+.5;
+    }
   }
   printf("%f\n",c);
   return 0;

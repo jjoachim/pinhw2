@@ -1,3 +1,3 @@
 Pin 2.12 kit 54730
-E: inscount0.cpp:124 cannot insert IPOINT_AFTER on an instruction without a fall-through path
-       2 0x00701812 call 0x701f60
+A: Source/pin/vm/vm_threaddb.cpp:FindThreadByStack:FindThreadByStack:908: assertion failed: (UINT32)threadId < PIN_MAX_THREADS
+
