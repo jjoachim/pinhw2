@@ -1,0 +1,14 @@
+    #!/bin/tcsh 			  
+    				  # first line specifies shell
+    #BSUB -J cpu2006_gcc_9 		  #name the job "jobname"
+    #BSUB -o out.gcc_9   		  #output->   out.o&ltjobID>
+    #BSUB -e err.gcc_9   		  #error -> error.o&ltjobID>
+    #BSUB -n 1 -W 12:00                 #4 CPUs and 1hr+30min
+    #BSUB -q serial                   #Use normal queue.
+    set echo                          #Echo all commands.
+    cd $LS_SUBCWD                     #cd to directory of submission
+    serialrun time $WORK/aashish/pin-2.0-7259-gcc.3.4-ia32-linux/Bin/pin -t $WORK/aashish/pin-2.0-7259-gcc.3.4-ia32-linux/ManualExamples/proccount -- $WORK/aashish/benchmarks/403.gcc/gcc_base.i386 scilab.i -o scilab.s
+                       #use ibrun for "pam -g 1 mvapich_wrapper"
+                                      #CPUs are specified above in -n option.
+
+

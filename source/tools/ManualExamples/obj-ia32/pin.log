@@ -1,3 +1,2 @@
 Pin 2.12 kit 54730
-A: Source/pin/vm/vm_threaddb.cpp:FindThreadByStack:FindThreadByStack:908: assertion failed: (UINT32)threadId < PIN_MAX_THREADS
-
+E: Unable to load ./inscount0.so: ./inscount0.so: undefined symbol: sem_wait

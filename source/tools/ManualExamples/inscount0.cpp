@@ -39,7 +39,7 @@ END_LEGAL */
 
 #define RDD_BINS 6 //This means track dependency distance from 2 to 2^n in increments of powers of 2.
 #define TEMPLOC_BINS 10 //the number of temporal locality distances, excluding infinite
-#define BBL_FIFOSZ 15 //size is 2^value
+#define BBL_FIFOSZ 14 //size is 2^value
 #define MF_FIFOSZ 15
 //Optional defines.  Turn turn off a feature, comment out the definition
 #define TRACK_TEMPORAL //undefine this to turn off all temporal calculations
@@ -62,8 +62,10 @@ using namespace std;
 //This array specifies how many LSB to ignore in address references when measuring temporal locality
 //char TempLocGran[]={0, 5, 11}; //ignore 0, 5 (32B), and 11 (2KB) bits of the referenced addresses respectively
 char TempLocGran[]={5, 11}; 
+#ifdef TRACK_TEMPORAL
 PIN_THREAD_UID ThreadUID[sizeof(TempLocGran)]; //an exit code for each granularity
 int SlaveMemParse[sizeof(TempLocGran)]; //how many memory locations have the slaves parsed (for moderator)
+#endif
 
 ofstream OutFile;
 
@@ -75,8 +77,10 @@ enum{
   cLD,
   cST,
   cBR,
+  cFBR,
   cBRT,
   cFBRT,
+  cBBRT,
   cMISC,
   INS_COUNT_SIZE
 };
@@ -118,41 +122,47 @@ static UINT64 ins_count[INS_COUNT_SIZE]; //The running count of instructions is 
 static int lbr_dist=0; //Last branch distance
 static int blk_count=0; //Number of blocks found
 CircularFIFO<int> blksz_FIFO(BBL_FIFOSZ); //FIFO for block size tracking thread
+//list<int> blksz_FIFO;
 vector<Counter> blksz_vect; //List of unique block size
 
 static Register_Hist regs[REG_LAST]; //A list of values that indicate a register's last use.  Used for RAW, WAW, and WAR
 static unsigned int RDD_count[RDD_SIZE][RDD_BINS]; //Stores RAW, WAW, and WAR counts
 
-CircularFIFO<ADDRINT> memref_FIFO(MF_FIFOSZ); //FIFO for temporal threads to read
+CircularFIFO<ADDRINT> memref_FIFO[sizeof(TempLocGran)]; //FIFO for temporal threads to read
 MF_COUNT_TYPE<Counter> mfc[sizeof(TempLocGran)]; //different temporal locality charts
 int thread_exit=0; //signal set by master to make the moderator and slaves exit
 
 // This function updates instruction counts
 VOID InsCountF(UINT32 type) {
-  lbr_dist++; //Every instruction increases the distance between two branches
-  ins_count[cDYN]++;
-  ins_count[type]++;
+  if(type==cDYN){ //increment general instruction statistics
+    lbr_dist++; //Every instruction increases the distance between two branches
+    ins_count[cDYN]++;
+  }
+  else //increment various specific types
+    ins_count[type]++;
 }
 
+// FIFO style (Virtual address problems within PIN cause this to bug)
 // This function updates instruction flow from branches and calls
 VOID BrCallCountF(ADDRINT current, ADDRINT target, BOOL taken){
   //Branch Distance calculation
   #ifdef TRACK_BBL_SZ
-    //cout << "New Block: " << lbr_dist << endl;
-    while(!blksz_FIFO.push(lbr_dist)){
-      
-      //cout << "BBL FIFO Waiting: " << blksz_FIFO.size() << endl;
-      usleep(10*1000);
-      
+    //int waitcount=0;
+    while( !blksz_FIFO.push(lbr_dist) ){
+      //cout << "BBL FIFO Waiting: " << blksz_FIFO.end() << ' ' << waitcount++ << endl;
+      //cout << "BBL FIFO Waiting: " << *tailp << ' ' << *headp << ' ' << tailp << ' ' << headp <<endl;
+      //usleep(10*1000);
     } //add new distance to fifo, or wait if it's full
     blk_count++; //increment the total count
     lbr_dist=0; //Reset the distance, note that lbr_dist is incremented in InsCountF() which is called in branches too
     //He's going the distance! He's going for speed! http://www.youtube.com/watch?v=__PU5CVSegg
   #endif
   //Branch Taken counters
+  if(target>current) ins_count[cFBR]++;
   if(taken){
     ins_count[cBRT]++;
     if(target>current) ins_count[cFBRT]++;
+    else ins_count[cBBRT]++;
   }
 }
 
@@ -161,27 +171,74 @@ VOID Para_BlockSizeTrackF(VOID* arg){
   blksz_vect.reserve(1000); //give it a good size so it doesn't need to realloc
   vector<Counter>::iterator it; //used for binary_search results
   Counter new_blk(0,1); //used as comparison element
-  int new_blk_dist=0; //used as target for read()
-  int* tailp=&blksz_FIFO.tailp;
-  while(thread_exit==0 || blksz_FIFO.valid()){
-    if(!blksz_FIFO.valid()){ //if there's no more elements waiting for us
+  int new_blk_dist=0;
+  bool valid=0;
+   while( (thread_exit==0) || valid){
+    valid=blksz_FIFO.read_tail(&new_blk_dist);
+    if(!valid){
+      thread_exit=PIN_IsProcessExiting(); //check PIN status
+      //cout << "BBL Slave Waiting: " << blksz_FIFO.begin() << ' ' << blksz_FIFO.end() << ' ' << blksz_FIFO.valid() << endl;
+      //usleep(10*1000);
+      continue;
+    }
+    blksz_FIFO.pop(); //pop as soon as possible since we already have the value
+    new_blk.distance=new_blk_dist;
+    it=lower_bound(blksz_vect.begin(), blksz_vect.end(), new_blk, Counter_LT);
+    //it=find(blksz_vect.begin(), blksz_vect.end(), new_blk);
+    if((it->distance)==new_blk.distance) //it was found!
+      (it->count)++; //increment the count
+    else //it was not found
+      blksz_vect.insert(it,new_blk); //insert it in the correct spot, inherently keeps it sorted
+      //blksz_vect.push_back(new_blk);
+  }
+}
+/*
+// list style
+// This function updates instruction flow from branches and calls
+VOID BrCallCountF(ADDRINT current, ADDRINT target, BOOL taken){
+  //Branch Distance calculation
+  #ifdef TRACK_BBL_SZ
+    blksz_FIFO.push_front(lbr_dist);
+    blk_count++; //increment the total count
+    lbr_dist=0; //Reset the distance, note that lbr_dist is incremented in InsCountF() which is called in branches too
+    //He's going the distance! He's going for speed! http://www.youtube.com/watch?v=__PU5CVSegg
+  #endif
+  //Branch Taken counters
+  if(target>current) ins_count[cFBR]++;
+  if(taken){
+    ins_count[cBRT]++;
+    if(target>current) ins_count[cFBRT]++;
+    else ins_count[cBBRT]++;
+  }
+}
+
+// Block Size Avg and STDV thread
+VOID Para_BlockSizeTrackF(VOID* arg){
+  blksz_vect.reserve(1000); //give it a good size so it doesn't need to realloc
+  vector<Counter>::iterator it; //used for binary_search results
+  Counter new_blk(0,1); //used as comparison element
+  int new_blk_dist=0;
+  bool valid=0;
+   while( (thread_exit==0) || valid){
+    valid=blksz_vect.size()>1;
+    //valid=blksz_FIFO.read_tail(&new_blk_dist);
+    if(!valid){
       thread_exit=PIN_IsProcessExiting(); //check PIN status
       continue;
     }
-    blksz_FIFO.read_tail(&new_blk_dist);
+    new_blk_dist=blksz_FIFO.back();
+    blksz_FIFO.pop_back(); //pop as soon as possible since we already have the value
     new_blk.distance=new_blk_dist;
-    //it=lower_bound(blksz_vect.begin(), blksz_vect.end(), new_blk, Counter_LT);
-    it=find(blksz_vect.begin(), blksz_vect.end(), new_blk);
-    if((it->distance)==new_blk_dist) //it was found!
+    it=lower_bound(blksz_vect.begin(), blksz_vect.end(), new_blk, Counter_LT);
+    //it=find(blksz_vect.begin(), blksz_vect.end(), new_blk);
+    if((it->distance)==new_blk.distance) //it was found!
       (it->count)++; //increment the count
     else //it was not found
-      //blksz_vect.insert(it,new_blk); //insert it in the correct spot, inherently keeps it sorted
-      blksz_vect.push_back(new_blk);
-
-    (*tailp)++;
-    //blksz_FIFO.pop(); //get rid of old element, will execute since blksz_FIFO.read() was true (aka an element existed) 
+      blksz_vect.insert(it,new_blk); //insert it in the correct spot, inherently keeps it sorted
+      //blksz_vect.push_back(new_blk);
   }
 }
+*/
 
 // These functions update RAW, WAW, and WAR stats.
 // This function sorts a value in distance bins based on RDD_BINS (<=2, <=4, ect...)
@@ -224,64 +281,65 @@ VOID RDDCountF(VOID* arglist, UINT32 size){
 // The moderator thread will delete memory accesses that the slaves have consumed
 // The slave threads will constantly read memory reference elements, waiting at the end, until told to stop
 VOID MemRefAddF(ADDRINT addr){ //used by the master thread to supply memory references
-  while(!memref_FIFO.push(addr)){
-    //cout << "MemFIFO Waiting: " << memref_FIFO.end()  << ' '  << memref_FIFO.size() << endl;
-    usleep(10*1000); 
-  }//push it as soon as possible
+  int waitcount;
+  for(unsigned int i=0; i<sizeof(TempLocGran); i++){
+    waitcount=0;
+    while(!memref_FIFO[i].push(addr)){
+      //cout << "MF FIFO Waiting: " << i << ' ' << memref_FIFO[i].end()  << ' ' << waitcount++  << endl;
+      //usleep(10*1000);
+    }
+  }
 }
 
+/*
 VOID MemRefModF(VOID* arg){ //moderator function, aka garbage
   //unsigned int i;
   //int ModMemParse=2; //keep track of clean up
   //int SMPmin;
-  int* tailp=&memref_FIFO.tailp;
+  UINT64* tailp=&memref_FIFO.tailp;
+  UINT64* headp=&memref_FIFO.headp;
+  UINT64 SMPmin; 
   while(thread_exit==0){ //exit flag given by master thread
-    /*
-    SMPmin=SlaveMemParse[0];
-    for(i=1; i<sizeof(TempLocGran); i++) //find last consumed element
-      if (SlaveMemParse[i] < SMPmin ) SMPmin=SlaveMemParse[i];
-    */
-    //SMPmin=*min_element(SlaveMemParse,SlaveMemParse+sizeof(TempLocGran));
-    //memref_FIFO.set_tail(SMPmin);
-    //cout << "popped: " << SMPmin-ModMemParse << endl;
-    //ModMemParse=SMPmin;
     thread_exit=PIN_IsProcessExiting();
-   //usleep(50*1000);
-    int SMPmin=*min_element(SlaveMemParse,SlaveMemParse+sizeof(TempLocGran));
+    if(*headp<=*tailp){
+      //cout << "Head: " << *headp << "\tTail: " << *tailp << endl;
+      //usleep(1*1000);
+      continue;
+    }
+    SMPmin=*min_element(SlaveMemParse,SlaveMemParse+sizeof(TempLocGran));
     *tailp=SMPmin;
-    usleep(1*1000);
   }
 }
+*/
 
 VOID Para_MemRefCountF(VOID* arg){ //slave function
   //parse inputs
-  unsigned int slaveid=*(unsigned int*)arg;
-  SlaveMemParse[slaveid]=3;
-  //int* tailp=&memref_FIFO.tailp;
+  unsigned int sid=*(unsigned int*)arg;
 
-  int gran=(int)TempLocGran[slaveid];
+  int gran=(int)TempLocGran[sid];
   list<MemRefTrack> mf_track; //LRU list of memory references, deleted when finished
   MF_COUNT_TYPE<Counter> mf_count;  
   #ifdef TEMPLOC_BINS //we already know how many bins we have for mf_count
     mf_count.resize(TEMPLOC_BINS);
+    for(unsigned int i=0; i<mf_count.size(); i++) 
+      mf_count[i].count=0; //don't forget to initialize them!!!
   #endif
 
   int dist;
   MemRefTrack new_ref;
-  ADDRINT addr=0; //address to parse, read from glit
+  ADDRINT addr=0; //address to parse, read from FIFO
   list<MemRefTrack>::iterator it; //iterator to search LRU memory table 
 
-  while( (SlaveMemParse[slaveid]<memref_FIFO.end()) || (thread_exit==0) ){ //loop until exit signal and out of memory elements
-    if(SlaveMemParse[slaveid]>=memref_FIFO.end()){ //not a new element, note: > should not happen anyway
+  bool valid=0;
+  while( valid || (thread_exit==0) ){ //loop until exit signal and out of memory elements
+    valid=memref_FIFO[sid].read_tail(&addr);
+    if(!valid){ //not a new element, note: > should not happen anyway
       thread_exit=PIN_IsProcessExiting();
-      //cout << "Slave "  << slaveid << " Waiting: " << SlaveMemParse[slaveid] << ' ' << memref_FIFO.size()  << endl;
-      //sleep(1);
-      //int SMPmin=*min_element(SlaveMemParse,SlaveMemParse+sizeof(TempLocGran));
-      //*tailp=SMPmin;
+      //cout << "Slave " << sid << " Waiting: " << memref_FIFO[sid].begin() << ' ' << memref_FIFO[sid].end()  << endl;
+      //usleep(10*1000);
       continue;
     }
-    //memref_FIFO.read(SlaveMemParse[slaveid],&addr);
-    addr=memref_FIFO.buff[SlaveMemParse[slaveid] & memref_FIFO.szmask];
+    memref_FIFO[sid].pop(); //already have the info, pop asap!
     addr=addr>>gran; //fit address to granularity
     new_ref.repeat=0; //don't know if we already have the address yet
     new_ref.addr=addr; //we do know this reference's address though
@@ -308,11 +366,9 @@ VOID Para_MemRefCountF(VOID* arg){ //slave function
       dist++; //this element doesn't match the memory address, so increment distance
     }
     mf_track.push_front(new_ref); //move the reference to the top of the stack
-    SlaveMemParse[slaveid]++; //I parsed one more memory reference
   }
-  cout << "Slave exiting\n" << endl;
   //Stop signal has been given
-  //Instert infinite reference distance
+  //Insert infinite reference distance
   Counter mfc(-1,0);
   mf_count.push_back(mfc);
   //Sort the inter-reference distance list
@@ -334,6 +390,9 @@ VOID Instruction(INS ins, VOID *v)
 {
     //Parse instruction type
     UINT32 type=cMISC;
+    UINT32 opcount=INS_OperandCount(ins); //Total operands in instruction
+
+    //MEMORY and ARITHMETIC
     if(INS_IsMemoryRead(ins)){
       type=cLD; //check memory read operation
       #ifdef TRACK_TEMPORAL 
@@ -346,30 +405,36 @@ VOID Instruction(INS ins, VOID *v)
         INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)MemRefAddF, IARG_MEMORYWRITE_EA, IARG_END);
       #endif
     }
-    else if(INS_IsBranchOrCall(ins)){ //check branch operation
-      type=cBR;
-      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)BrCallCountF, IARG_INST_PTR, IARG_BRANCH_TARGET_ADDR, IARG_BRANCH_TAKEN, IARG_END);
-    }
-    else{ //check arithmetic operation
-      UINT32 opcount=INS_OperandCount(ins); //Total operands in instruction
-      if(opcount){ //If there's at least one, the first one must be a destination register
-        if(INS_OperandIsReg(ins,0)){ //check to make sure that it is a destination for shits n giggles
-          REG reg=INS_OperandReg(ins,0);
-          if(REG_is_fr(reg)) type=cFL; //If the DR is a floating point, then it is a floating point operation
-          else type=cINT; //otherwise, it must be an integer operation
-        }
+    else if(opcount){ //check arithmetic operation
+      if(INS_OperandIsReg(ins,0)){ //check to make sure that it is a destination
+        REG reg=INS_OperandReg(ins,0);
+        if(REG_is_fr(reg)) type=cFL; //If the DR is a floating point, then it is a floating point operation
+        else type=cINT; //otherwise, it must be an integer operation
       }
+    }
+    if(type!=cMISC) //was it any of the above?
+      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)InsCountF, IARG_UINT32, type, IARG_END);
+
+    //BRANCH
+    if(INS_IsBranchOrCall(ins)){ //check branch operation
+      type=cBR;
+      //Branch taken and BBL stuff
+      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)BrCallCountF, IARG_INST_PTR, IARG_BRANCH_TARGET_ADDR, IARG_BRANCH_TAKEN, IARG_END);
+      //Don't forget to count the branch for instruction statistics as well!
+      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)InsCountF, IARG_UINT32, type, IARG_END);
+    }
+    //Tracks RDD stuff
+    if(opcount){ //if there are no ops, this is no use
       Register_Use* ops_used=new Register_Use[opcount]; //A list of operands used in this instruction
       for(UINT32 i=0; i<opcount; i++){ //Parse through all the operands, list their ID and if they are R_Wr
         ops_used[i].ID=(int)INS_OperandReg(ins,i); //immidiates are stored as ID=0
-        ops_used[i].Rd_Wr=INS_OperandWritten(ins,i); //0 is Read, 1 is Write
+        ops_used[i].Rd_Wr=INS_OperandWritten(ins,i); //0 is Read, 1 is Write to register
       }
-      //Tracks RDD stuff
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)RDDCountF, IARG_PTR, (VOID*)ops_used, IARG_UINT32, opcount, IARG_END);
     }
-    //Tracks instruction distribution
+    //Increment dynamic count and BBL length
+    type=cDYN;
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)InsCountF, IARG_UINT32, type, IARG_END);
-    //cout << "New instruction\n";
 }
 
 // Commandline Switch Parsing
@@ -381,7 +446,7 @@ VOID Fini(INT32 code, VOID *v)
 {
     // All threads have stopped by this point
     // BBL Mean
-    unsigned long int blksz_accum=0;
+    UINT64 blksz_accum=0;
     double blksz_accumd=0;
     for(unsigned int i=0; i<blksz_vect.size(); i++){
       blksz_accum+=(blksz_vect[i].distance*blksz_vect[i].count); //add distances multiplied by how many times they occured
@@ -412,9 +477,9 @@ VOID Fini(INT32 code, VOID *v)
     cout << "Load:\t" << ins_count[cLD] << endl;
     cout << "Store:\t" << ins_count[cST] << endl;
     cout << "Branch:\t" << ins_count[cBR] << endl;
-    cout << "BranchT:\t" << ins_count[cBRT] << endl;
-    cout << "FBranchT:\t" << ins_count[cFBRT] << endl;
-    cout << "BBranchT:\t" << ins_count[cBRT]-ins_count[cFBRT] << endl;
+    cout << "BranchT:\t" << (double)ins_count[cBRT]/ins_count[cBR] << endl;
+    cout << "FBranchT:\t" << (double)ins_count[cFBRT]/ins_count[cFBR] << endl;
+    cout << "BBranchT:\t" << (double)ins_count[cBBRT]/(ins_count[cBR]-ins_count[cFBR]) << endl;
     cout << "Other:\t" << ins_count[cMISC] << endl;
     cout << "BBL Count:\t" << blk_count << endl;
     cout << "BBL Size Avg:\t" << bblsz_mean << "\tEstimate: " << bblsz_meand << endl;
@@ -489,11 +554,12 @@ int main(int argc, char * argv[])
     // Start temporal locality threads
     #ifdef TRACK_TEMPORAL
       if(sizeof(TempLocGran)){ //Don't need garabage collection if we have no granularity
-        PIN_SpawnInternalThread(MemRefModF,NULL,0,NULL); //Moderator 
-        cout << "PIN: Spawning Temportal Locality Garbage Collector" << endl;
+        //PIN_SpawnInternalThread(MemRefModF,NULL,0,NULL); //Moderator 
+        //cout << "PIN: Spawning Temportal Locality Garbage Collector" << endl;
       }
       for(unsigned int i=0; i<sizeof(TempLocGran); i++){
         SlaveMemParse[i]=i;
+        memref_FIFO[i].init(MF_FIFOSZ);
         PIN_SpawnInternalThread(Para_MemRefCountF, &SlaveMemParse[i], 0, &ThreadUID[i]); //Moderator
         cout << "PIN: Temporal Locality Thread " << i << " Spawned" << endl;
       }
